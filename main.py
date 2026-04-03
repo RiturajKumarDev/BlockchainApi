@@ -1,7 +1,7 @@
 import os
 import json
-import base64
 import hashlib
+from pathlib import Path
 from flask import Flask, request, jsonify
 from algosdk import account, mnemonic, transaction
 from algosdk.v2client import algod
@@ -9,45 +9,58 @@ from algosdk.v2client import algod
 app = Flask(__name__)
 
 # =========================
-# Env variables
+# Config
 # =========================
 ALGOD_ADDRESS = os.getenv("ALGOD_ADDRESS", "https://testnet-api.algonode.cloud")
-ALGOD_TOKEN = os.getenv("ALGOD_TOKEN", "")  # Algonode ke liye blank ho sakta hai
-ALGOD_HEADERS_JSON = os.getenv("ALGOD_HEADERS", "{}")
+ALGOD_TOKEN = os.getenv("ALGOD_TOKEN", "")
+WALLET_FILE = os.getenv("WALLET_FILE", "algo_wallet.json")
 
-# 25-word mnemonic of sender wallet
-ALGO_MNEMONIC = os.getenv("ALGO_MNEMONIC", "")
-
-# Optional: explorer base
-EXPLORER_TX_BASE = os.getenv(
-    "EXPLORER_TX_BASE", "https://lora.algokit.io/testnet/transaction/"
-)
-
-# Optional existing app id (future smart-contract use)
-APP_ID = int(os.getenv("APP_ID", "758217797"))
-
-try:
-    ALGOD_HEADERS = json.loads(ALGOD_HEADERS_JSON)
-except Exception:
-    ALGOD_HEADERS = {}
-
-algod_client = algod.AlgodClient(ALGOD_TOKEN, ALGOD_ADDRESS, headers=ALGOD_HEADERS)
+algod_client = algod.AlgodClient(ALGOD_TOKEN, ALGOD_ADDRESS)
 
 
-def get_account_from_mnemonic():
-    if not ALGO_MNEMONIC.strip():
-        raise ValueError("ALGO_MNEMONIC is missing in environment variables")
-
-    private_key = mnemonic.to_private_key(ALGO_MNEMONIC)
-    sender_address = account.address_from_private_key(private_key)
-    return private_key, sender_address
-
-
-def wait_for_confirmation(client, tx_id, timeout=10):
+# =========================
+# Wallet helpers
+# =========================
+def create_wallet_file():
     """
-    Wait until the transaction is confirmed or timeout rounds pass.
+    Create a new Algorand account and save it locally.
+    NOTE: In production, don't store mnemonic in plain JSON.
     """
-    start_round = client.status().get("last-round", 0) + 1
+    private_key, address = account.generate_account()
+    wallet_mnemonic = mnemonic.from_private_key(private_key)
+
+    wallet_data = {"address": address, "mnemonic": wallet_mnemonic}
+
+    with open(WALLET_FILE, "w", encoding="utf-8") as f:
+        json.dump(wallet_data, f, indent=2)
+
+    return wallet_data
+
+
+def load_or_create_wallet():
+    wallet_path = Path(WALLET_FILE)
+
+    if not wallet_path.exists():
+        return create_wallet_file()
+
+    with open(wallet_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_private_key_and_address():
+    wallet = load_or_create_wallet()
+    wallet_mnemonic = wallet["mnemonic"]
+    private_key = mnemonic.to_private_key(wallet_mnemonic)
+    address = wallet["address"]
+    return private_key, address
+
+
+def wait_for_confirmation(client, tx_id, timeout=15):
+    """
+    Wait for tx confirmation.
+    """
+    last_round = client.status()["last-round"]
+    start_round = last_round + 1
 
     for current_round in range(start_round, start_round + timeout):
         pending_txn = client.pending_transaction_info(tx_id)
@@ -55,12 +68,15 @@ def wait_for_confirmation(client, tx_id, timeout=10):
             return pending_txn
         client.status_after_block(current_round)
 
-    raise TimeoutError("Transaction not confirmed after timeout")
+    raise TimeoutError("Transaction not confirmed in time")
 
 
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def home():
-    return jsonify({"message": "Fruit Hash API is running with Algorand blockchain"})
+    return jsonify({"message": "Fruit Blockchain API is running"})
 
 
 @app.get("/health")
@@ -68,143 +84,102 @@ def health():
     return jsonify({"status": "ok"})
 
 
-@app.get("/account")
-def account_info():
+@app.get("/create-wallet")
+def create_wallet():
     try:
-        _, sender = get_account_from_mnemonic()
-        info = algod_client.account_info(sender)
+        if os.path.exists(WALLET_FILE):
+            with open(WALLET_FILE, "r", encoding="utf-8") as f:
+                wallet = json.load(f)
+            return jsonify(
+                {
+                    "success": True,
+                    "message": "Wallet already exists",
+                    "address": wallet["address"],
+                }
+            )
 
+        wallet = create_wallet_file()
         return jsonify(
             {
                 "success": True,
-                "address": sender,
-                "amount_microalgo": info.get("amount", 0),
-                "min_balance_microalgo": info.get("min-balance", 0),
-                "status": "ready",
+                "message": "Wallet created successfully",
+                "address": wallet["address"],
+                "mnemonic": wallet["mnemonic"],
             }
         )
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.post("/store-hash")
-def store_hash():
+@app.get("/wallet-info")
+def wallet_info():
+    try:
+        _, address = get_private_key_and_address()
+        info = algod_client.account_info(address)
+
+        return jsonify(
+            {
+                "success": True,
+                "address": address,
+                "balance_microalgo": info.get("amount", 0),
+                "min_balance_microalgo": info.get("min-balance", 0),
+            }
+        )
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.post("/store-data")
+def store_data():
+    """
+    Input JSON lo
+    -> canonical JSON banao
+    -> SHA256 hash nikalo
+    -> blockchain transaction bhejo
+    -> tx_id return karo
+    """
     try:
         body = request.get_json()
         if not body:
             return jsonify({"success": False, "error": "No JSON body provided"}), 400
 
-        # 1) Canonical JSON
         canonical = json.dumps(body, separators=(",", ":"), sort_keys=True)
-
-        # 2) SHA256 hash
         data_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-        # 3) Algorand note payload
+        # Note payload: compact rakho
         note_payload = {
-            "type": "fruit_freshness_hash",
+            "type": "fruit_scan",
             "hash": data_hash,
-            "sha": "sha256",
-            "app_id": APP_ID,
-            "ts": body.get("timestamp"),
             "fruit": body.get("fruit_type"),
-            "device_id": body.get("device_id"),
+            "device": body.get("device_id"),
+            "ts": body.get("timestamp"),
         }
-
         note_bytes = json.dumps(
             note_payload, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
 
-        # 4) Sender account
-        private_key, sender_address = get_account_from_mnemonic()
+        private_key, sender = get_private_key_and_address()
 
-        # 5) Suggested params
         params = algod_client.suggested_params()
 
-        # 6) Self-payment txn with note
-        # amount = 0 microAlgo -> only metadata anchoring
+        # self transaction, amount = 0
         txn = transaction.PaymentTxn(
-            sender=sender_address,
-            sp=params,
-            receiver=sender_address,
-            amt=0,
-            note=note_bytes,
+            sender=sender, sp=params, receiver=sender, amt=0, note=note_bytes
         )
 
         signed_txn = txn.sign(private_key)
         tx_id = algod_client.send_transaction(signed_txn)
-
-        # 7) Wait for confirmation
-        confirmed_txn = wait_for_confirmation(algod_client, tx_id, timeout=10)
-
-        confirmed_round = confirmed_txn.get("confirmed-round", 0)
+        confirmed_txn = wait_for_confirmation(algod_client, tx_id)
 
         return jsonify(
             {
                 "success": True,
-                "message": "Hash stored on Algorand blockchain successfully",
+                "message": "Data hash stored on blockchain",
                 "hash": data_hash,
                 "tx_id": tx_id,
-                "confirmed_round": confirmed_round,
-                "sender": sender_address,
-                "app_id": APP_ID,
-                "note_preview": note_payload,
-                "explorer_url": f"{EXPLORER_TX_BASE}{tx_id}",
-            }
-        )
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.post("/verify-hash")
-def verify_hash():
-    try:
-        body = request.get_json()
-        if not body:
-            return jsonify({"success": False, "error": "No JSON body provided"}), 400
-
-        tx_id = body.get("tx_id")
-        original_data = body.get("data")
-
-        if not tx_id:
-            return jsonify({"success": False, "error": "tx_id is required"}), 400
-
-        if not original_data:
-            return jsonify({"success": False, "error": "data is required"}), 400
-
-        # Recreate hash from provided data
-        canonical = json.dumps(original_data, separators=(",", ":"), sort_keys=True)
-        recomputed_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-        pending = algod_client.pending_transaction_info(tx_id)
-
-        # Sometimes note may not be in pending after confirmation on some providers.
-        # So try confirmed transaction lookup via algod block info if needed.
-        note_b64 = pending.get("txn", {}).get("txn", {}).get("note")
-
-        if not note_b64:
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": "Could not read note from transaction using current provider. Use indexer for deep verification.",
-                    }
-                ),
-                500,
-            )
-
-        note_json = json.loads(base64.b64decode(note_b64).decode("utf-8"))
-        onchain_hash = note_json.get("hash")
-
-        return jsonify(
-            {
-                "success": True,
-                "tx_id": tx_id,
-                "recomputed_hash": recomputed_hash,
-                "onchain_hash": onchain_hash,
-                "matched": recomputed_hash == onchain_hash,
-                "note_payload": note_json,
+                "confirmed_round": confirmed_txn.get("confirmed-round", 0),
+                "wallet_address": sender,
+                "note_data": note_payload,
             }
         )
 
@@ -213,4 +188,4 @@ def verify_hash():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5000)
